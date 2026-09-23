@@ -9,6 +9,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/dma-mapping.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -662,6 +663,66 @@ static int cpi_hw_set_geometry(struct cpi_dev *cpi)
 	return 0;
 }
 
+static bool cpi_is_userptr(struct cpi_dev *cpi)
+{
+	return cpi->vb_queue.memory == VB2_MEMORY_USERPTR;
+}
+
+static void cpi_free_bounce(struct cpi_dev *cpi)
+{
+	if (!cpi->bounce_cpu)
+		return;
+
+	dma_free_coherent(&cpi->pdev->dev, cpi->bounce_size,
+			  cpi->bounce_cpu, cpi->bounce_dma);
+	cpi->bounce_cpu = NULL;
+	cpi->bounce_dma = 0;
+	cpi->bounce_size = 0;
+}
+
+static int cpi_alloc_bounce(struct cpi_dev *cpi)
+{
+	unsigned int size = cpi->format.fmt.pix.sizeimage;
+
+	if (!size)
+		return -EINVAL;
+
+	if (cpi->bounce_cpu) {
+		if (cpi->bounce_size >= size)
+			return 0;
+		cpi_free_bounce(cpi);
+	}
+
+	cpi->bounce_cpu = dma_alloc_coherent(&cpi->pdev->dev, size, &cpi->bounce_dma, GFP_KERNEL);
+	if (!cpi->bounce_cpu)
+		return -ENOMEM;
+
+	cpi->bounce_size = size;
+	return 0;
+}
+
+static void cpi_copy_bounce_to_user(struct cpi_dev *cpi)
+{
+	struct rx_buffer *buf;
+	unsigned int size = cpi->format.fmt.pix.sizeimage;
+
+	spin_lock_irq(&cpi->slock);
+	if (cpi->stopping && !cpi->active) {
+		spin_unlock_irq(&cpi->slock);
+		return;
+	}
+	buf = cpi->active;
+	spin_unlock_irq(&cpi->slock);
+
+	if (!buf || !buf->cpu_addr || !cpi->bounce_cpu || !size)
+		return;
+
+	if (size > cpi->bounce_size)
+		size = cpi->bounce_size;
+
+	memcpy(buf->cpu_addr, cpi->bounce_cpu, size);
+}
+
 static int cpi_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
 			   unsigned int *nplanes, unsigned int sizes[],
 			struct device *alloc_devs[])
@@ -672,6 +733,16 @@ static int cpi_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
 	size = cpi->format.fmt.pix.sizeimage;
 	if (size == 0)
 		return -EINVAL;
+
+	/*
+	 * USERPTR buffers are only virtually contiguous. CPI can DMA to a
+	 * single physical address, so map the user pages with vmalloc memops
+	 * and bounce through reserved SRAM.
+	 */
+	if (vq->memory == VB2_MEMORY_USERPTR)
+		vq->mem_ops = &vb2_vmalloc_memops;
+	else
+		vq->mem_ops = &vb2_dma_contig_memops;
 
 	if (*nbuffers > N_BUFFERS)
 		*nbuffers = N_BUFFERS;
@@ -717,8 +788,13 @@ static void cpi_buffer_queue(struct vb2_buffer *vb)
 
 	spin_lock_irqsave(&cpi->slock, flags);
 	list_add_tail(&buf->list, &cpi->fb_list_head);
-	buf->dma_addr = vb2_dma_contig_plane_dma_addr(vb, 0);
-	buf->cpu_addr = vb2_plane_vaddr(vb, 0);
+	if (cpi_is_userptr(cpi)) {
+		buf->dma_addr = cpi->bounce_dma;
+		buf->cpu_addr = vb2_plane_vaddr(vb, 0);
+	} else {
+		buf->dma_addr = vb2_dma_contig_plane_dma_addr(vb, 0);
+		buf->cpu_addr = vb2_plane_vaddr(vb, 0);
+	}
 
 	if (!cpi->active) {
 		cpi->active = buf;
@@ -757,9 +833,24 @@ static int cpi_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 	u64 streams_mask = BIT(0);
 	int ret;
 
+	cpi->stopping = false;
+
+	if (cpi_is_userptr(cpi)) {
+		struct rx_buffer *buf;
+
+		ret = cpi_alloc_bounce(cpi);
+		if (ret)
+			goto error_state;
+
+		spin_lock_irq(&cpi->slock);
+		list_for_each_entry(buf, &cpi->fb_list_head, list)
+			buf->dma_addr = cpi->bounce_dma;
+		spin_unlock_irq(&cpi->slock);
+	}
+
 	ret = video_device_pipeline_alloc_start(vfd);
 	if (ret < 0)
-		goto error_state;
+		goto error_bounce;
 
 	ret = v4l2_subdev_enable_streams(sd, pad, streams_mask);
 	if (ret)
@@ -768,6 +859,8 @@ static int cpi_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 	return 0;
 error_streaming:
 	video_device_pipeline_stop(vfd);
+error_bounce:
+	cpi_free_bounce(cpi);
 error_state:
 	spin_lock_irq(&cpi->slock);
 	cpi_return_all_buffers_locked(cpi, VB2_BUF_STATE_QUEUED);
@@ -782,6 +875,14 @@ static void cpi_vb2_stop_streaming(struct vb2_queue *q)
 	struct v4l2_subdev *sd = &cpi->subdev;
 	u64 streams_mask = BIT(0);
 
+	spin_lock_irq(&cpi->slock);
+	cpi->stopping = true;
+	cpi_hw_disable_interrupts(cpi, INTR_VSYNC | INTR_BRESP_ERR | INTR_OUTFIFO_OVERRUN |
+				  INTR_STOP);
+	spin_unlock_irq(&cpi->slock);
+
+	synchronize_irq(cpi->irq);
+
 	v4l2_subdev_disable_streams(sd, CPI_PAD_SOURCE, streams_mask);
 
 	video_device_pipeline_stop(vfd);
@@ -789,6 +890,8 @@ static void cpi_vb2_stop_streaming(struct vb2_queue *q)
 	spin_lock_irq(&cpi->slock);
 	cpi_return_all_buffers_locked(cpi, VB2_BUF_STATE_ERROR);
 	spin_unlock_irq(&cpi->slock);
+
+	cpi_free_bounce(cpi);
 }
 
 static const struct vb2_ops vb2_video_qops = {
@@ -1260,8 +1363,6 @@ static void cpi_hw_disable(struct cpi_dev *cpi)
 
 	spin_lock_irq(&cpi->slock);
 
-	cpi_return_all_buffers_locked(cpi, VB2_BUF_STATE_ERROR);
-
 	cpi_hw_disable_interrupts(cpi, INTR_VSYNC |
 				INTR_BRESP_ERR |
 				INTR_OUTFIFO_OVERRUN |
@@ -1356,16 +1457,19 @@ static int cpi_disable_streams(struct v4l2_subdev *sd,
 	cpi->enabled_pad_mask &= (~BIT_ULL(pad));
 
 	if (!cpi->enabled_pad_mask) {
+		int ret = 0;
+
+		if (cpi->remote_sd) {
+			sink_streams = v4l2_subdev_state_xlate_streams(state, pad, CPI_PAD_SINK,
+								       &streams_mask);
+			ret = v4l2_subdev_disable_streams(cpi->remote_sd, cpi->remote_pad,
+							  sink_streams);
+		} else {
+			ret = -ENOLINK;
+		}
+
 		cpi_hw_disable(cpi);
-
-		if (!cpi->remote_sd)
-			return -ENOLINK;
-
-		sink_streams = v4l2_subdev_state_xlate_streams(state,
-							       pad, CPI_PAD_SINK, &streams_mask);
-
-		return v4l2_subdev_disable_streams(cpi->remote_sd, cpi->remote_pad,
-				sink_streams);
+		return ret;
 	}
 
 	return 0;
@@ -1691,11 +1795,10 @@ static inline void cpi_change_buffer(struct cpi_dev *cpi)
 		vb2_buffer_done(&vbuf->vb2_buf, VB2_BUF_STATE_DONE);
 	}
 
-	if (list_empty(&cpi->fb_list_head)) {
+	if (cpi->stopping || list_empty(&cpi->fb_list_head)) {
 		cpi->active = NULL;
 	} else {
-		cpi->active = list_entry(cpi->fb_list_head.next,
-					 struct rx_buffer, list);
+		cpi->active = list_entry(cpi->fb_list_head.next, struct rx_buffer, list);
 		cpi_hw_setup_buffer(cpi);
 		cpi_hw_start_video_capture(cpi);
 	}
@@ -1740,8 +1843,20 @@ static irqreturn_t cpi_isr(int irq, void *dev)
 
 	if (int_st & INTR_STOP) {
 		dev_dbg(&pdev->dev, "capture complete\n");
+		if (cpi_is_userptr(cpi))
+			return IRQ_WAKE_THREAD;
 		cpi_change_buffer(cpi);
 	}
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t cpi_isr_thread(int irq, void *dev)
+{
+	struct cpi_dev *cpi = dev;
+
+	cpi_copy_bounce_to_user(cpi);
+	cpi_change_buffer(cpi);
 
 	return IRQ_HANDLED;
 }
@@ -1862,10 +1977,11 @@ static int cpi_probe(struct platform_device *pdev)
 		return cpi->irq;
 	}
 
-	ret = devm_request_irq(&pdev->dev, cpi->irq, cpi_isr, 0,
-			       "CPI", cpi);
+	ret = devm_request_threaded_irq(&pdev->dev, cpi->irq, cpi_isr,
+					cpi_isr_thread, IRQF_ONESHOT,
+					"CPI", cpi);
 	if (ret) {
-		dev_err(&cpi->pdev->dev, "devm_request_irq() failed with %d\n",
+		dev_err(&cpi->pdev->dev, "devm_request_threaded_irq() failed with %d\n",
 			ret);
 		return ret;
 	}
@@ -1939,6 +2055,7 @@ static void cpi_remove(struct platform_device *pdev)
 		vb2_queue_release(&cpi->vb_queue);
 	}
 
+	cpi_free_bounce(cpi);
 	of_reserved_mem_device_release(&pdev->dev);
 }
 

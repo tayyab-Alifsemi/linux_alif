@@ -105,6 +105,10 @@ struct cpi_dev {
 	struct list_head fb_list_head;
 	struct rx_buffer *active;
 
+	void *bounce_cpu;
+	dma_addr_t bounce_dma;
+	size_t bounce_size;
+
 	struct media_pad vd_pad;
 	struct media_pad subdev_pads[CPI_PADS_NUM];
 	struct v4l2_subdev subdev;
@@ -144,6 +148,7 @@ struct cpi_dev {
 	bool is_isp_connected;
 	bool in_pipeline_propagation;
 	bool streaming;
+	bool stopping;
 };
 
 static inline struct cpi_dev *
