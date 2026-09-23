@@ -78,7 +78,7 @@
 #define CPI_FIFO_WR_WMARK_DEFAULT	0x18
 
 #define CPI_BUSY_POLL_USEC	10
-#define CPI_BUSY_TIMEOUT_USEC	20000
+#define CPI_BUSY_TIMEOUT_USEC	200000
 static const struct plat_csi_fmt cpi_formats[] = {
 	{
 		.name = "BGR888",
@@ -426,6 +426,14 @@ static inline void cpi_hw_disable_interrupts(struct cpi_dev *cpi,
 	writel(val, cpi->base_addr + CPI_INTR_ENA);
 }
 
+static inline void cpi_hw_clear_interrupts(struct cpi_dev *cpi)
+{
+	u32 pending = readl(cpi->base_addr + CPI_INTR);
+
+	if (pending)
+		writel(pending, cpi->base_addr + CPI_INTR);
+}
+
 static inline int cpi_hw_setup_buffer(struct cpi_dev *cpi)
 {
 	if (!cpi->active)
@@ -435,11 +443,37 @@ static inline int cpi_hw_setup_buffer(struct cpi_dev *cpi)
 	return 0;
 }
 
-static void cpi_hw_start_video_capture(struct cpi_dev *cpi)
+static void cpi_hw_reset(struct cpi_dev *cpi)
 {
 	writel(0, cpi->base_addr + CPI_CTRL);
 	writel(CTRL_SW_RESET, cpi->base_addr + CPI_CTRL);
 	writel(0, cpi->base_addr + CPI_CTRL);
+}
+
+static int cpi_hw_wait_idle(struct cpi_dev *cpi)
+{
+	u32 val;
+
+	return readl_poll_timeout(cpi->base_addr + CPI_CTRL, val, !(val & CTRL_BUSY),
+				 CPI_BUSY_POLL_USEC, CPI_BUSY_TIMEOUT_USEC);
+}
+
+static int cpi_hw_recover(struct cpi_dev *cpi)
+{
+	int ret;
+
+	cpi_hw_reset(cpi);
+
+	ret = cpi_hw_wait_idle(cpi);
+	if (ret)
+		dev_err(&cpi->pdev->dev, "CPI still busy after reset\n");
+
+	return ret;
+}
+
+static void cpi_hw_start_video_capture(struct cpi_dev *cpi)
+{
+	cpi_hw_reset(cpi);
 
 	if (cpi->active)
 		writel(cpi->active->dma_addr, cpi->base_addr + CPI_FRAME_ADDR);
@@ -1217,8 +1251,15 @@ static int cpi_hw_configure(struct cpi_dev *cpi)
 	ret = cpi_hw_status(cpi);
 	if (ret) {
 		spin_unlock_irq(&cpi->slock);
-		dev_err(&cpi->pdev->dev, "CPI is busy\n");
-		return ret;
+		dev_warn(&cpi->pdev->dev, "CPI is busy, resetting\n");
+
+		ret = cpi_hw_recover(cpi);
+		if (ret) {
+			dev_err(&cpi->pdev->dev, "CPI is busy\n");
+			return ret;
+		}
+
+		spin_lock_irq(&cpi->slock);
 	}
 
 	cpi_hw_set_geometry(cpi);
@@ -1232,6 +1273,7 @@ static int cpi_hw_configure(struct cpi_dev *cpi)
 		return -EINVAL;
 	}
 
+	cpi_hw_clear_interrupts(cpi);
 	cpi_hw_enable_interrupts(cpi, INTR_VSYNC |
 		     INTR_BRESP_ERR |
 		     INTR_OUTFIFO_OVERRUN |
@@ -1255,7 +1297,6 @@ static void cpi_hw_enable(struct cpi_dev *cpi)
 
 static void cpi_hw_disable(struct cpi_dev *cpi)
 {
-	u32 val;
 	int ret;
 
 	spin_lock_irq(&cpi->slock);
@@ -1266,14 +1307,14 @@ static void cpi_hw_disable(struct cpi_dev *cpi)
 				INTR_BRESP_ERR |
 				INTR_OUTFIFO_OVERRUN |
 				INTR_STOP);
-	writel(0, cpi->base_addr + CPI_CTRL);
+
+	cpi_hw_reset(cpi);
+	cpi_hw_clear_interrupts(cpi);
 
 	spin_unlock_irq(&cpi->slock);
 
-	ret = readl_poll_timeout(cpi->base_addr + CPI_CTRL,
-				 val, !(val & CTRL_BUSY), CPI_BUSY_POLL_USEC,
-			CPI_BUSY_TIMEOUT_USEC);
-	if (ret) {
+	ret = cpi_hw_wait_idle(cpi);
+	if (ret && cpi_hw_recover(cpi)) {
 		dev_err(&cpi->pdev->dev,
 			"Failed to stop the Camera controller.\n");
 	}
